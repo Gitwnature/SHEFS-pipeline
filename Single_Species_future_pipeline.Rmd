@@ -20,9 +20,11 @@ library(envirem)
 library(tiff)
 library(rgdal)
 
+# set the working directory here
 setwd("~/School/UCL/SHEFS project/R pipeline/SHEFS_modeling")
 
-#source("SA_pipeline_functions.R")
+# This is to automatically run functions from file "SA_pipeline_functions.R" when they are called
+#source("SA_pipeline_functions.R") 
 
 ```
 
