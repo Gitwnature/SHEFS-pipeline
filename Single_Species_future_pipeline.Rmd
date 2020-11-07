@@ -1,0 +1,685 @@
+---
+title: "Single Species future pipeline"
+output: html_document
+---
+
+
+```{r}
+
+library(CoordinateCleaner)
+library(dplyr)
+library(here)
+library(lwgeom)
+library(raster)
+library(readr)
+library(sf)
+library(caret)
+library(randomForest)
+library(base)
+library(envirem)
+library(tiff)
+library(rgdal)
+
+setwd("~/School/UCL/SHEFS project/R pipeline/SHEFS_modeling")
+
+#source("SA_pipeline_functions.R")
+
+```
+
+Subsets of the study area to zoom in on combination maps: 
+
+
+
+**Step 1: Data Preparation**
+Set study region, bioclim layers, minimum occurrence records
+
+```{r}
+
+# We are only interested in species occurrences in the study region around South Africa - covered in the extents below
+ymin <- -36 # South
+ymax <- -21 # North
+xmin <- 14 # West
+xmax <- 35 # East
+
+
+ext_occ <- extent(xmin, xmax, ymin, ymax)
+
+# minimum number of occurrence points needed for the species to be included in the models
+min_occ <- 20 
+
+#the number of the bioclim layers to be included as environmental variables - https://worldclim.org/bioclim
+bioclim_layers <- c(1, 5, 6, 13, 14)
+
+```
+
+Step 2
+Load and crop the environmental data:
+
+```{r}
+
+# alternate code (Vivienne):
+path<-'CHELSA/' # in the working directory
+
+bio_layers <- list.files(path, pattern = 'tif') # five TIFs
+bio_layers1<-paste(path, bio_layers, sep="") # this line makes sure that it knows the full path, compare prints of bio_layers and bio_layers1
+bio_layers2 <-lapply(bio_layers1,raster)
+env_layers <- raster::stack(bio_layers2)
+
+# crop returns a geographic subset of an object as specified by an Extent object 
+env_crop <- raster::crop(env_layers, ext_occ)
+
+```
+
+Step 3
+Download GBIF species data:
+(Read gbifData() function into environment first)
+```{r}
+
+#This code creates this directory if it does not already exist
+if (!dir.exists(here::here("points/raw"))) {
+  dir.create(here::here("points/raw/"), recursive = TRUE)
+}
+
+# aphids
+sp_name <- "nezara_viridula"
+
+spxy_out <- gbifData(
+  sp_name = sp_name,
+  ext_occ = ext_occ, # area over which occurrence points will be downloaded
+  out_dir = here::here("points/raw"), # where points will be saved
+  min_occ = min_occ
+)
+
+
+```
+
+Step 4
+Coordinate Cleaner, rarefy points
+(read cc_wrapper(), rarefyPoints() functions into environment)
+```{r}
+
+if (!dir.exists(here::here("points/cleaned_raw"))) {
+  dir.create(here::here("points/cleaned_raw/"))
+}
+
+# Cleaning the coordinates using the CoordinateCleaner package - https://cran.r-project.org/web/packages/CoordinateCleaner/CoordinateCleaner.pdf
+cc_wrapper(
+  sp_name = sp_name,
+  in_dir = here::here("points/raw"),
+  out_dir = here::here("points/cleaned_raw")
+)
+
+# Rarefy Points - so there is only one occurrence point per grid cell
+if (!dir.exists(here::here("points/rarefied"))) {
+  dir.create(here::here("points/rarefied/"))
+}
+
+# create large raster layer called ref_map
+ref_map <- env_crop[[1]]
+ref_map[!is.na(ref_map)] <- 0   #ref_map should be full of non-1 values
+
+rarefyPoints(
+  sp_name = sp_name,
+  in_dir = here::here("points/cleaned_raw"),
+  out_dir = here::here("points/rarefied/"),
+  ref_map = ref_map
+)
+
+```
+
+Step 5
+Extract environmental data for presence points
+**Load ras_extract() function**
+```{r}
+
+# Extract Data for presence points
+if (!dir.exists(here::here("environmental/presence/"))) {
+  dir.create(here::here("environmental/presence/"), recursive = TRUE)
+}
+
+ras_extract(
+  sp_name = sp_name,
+  in_dir = here::here("points/rarefied"),
+  out_dir = here::here("environmental/presence"),
+  raster_in = env_crop
+)
+
+```
+
+Step 6
+Create background and pseudoabsence points - need to think about buffer and density values
+**Load background_sampler() function**
+```{r}
+
+if (!dir.exists(here::here("points/background/"))) {
+  dir.create(here::here("points/background/"))
+}
+
+if (!dir.exists(here::here("points/pseudoabsence/"))) {
+  dir.create(here::here("points/pseudoabsence/"))
+}
+
+#wwf_ecoregions_get() # this should download the wwf ecoregions data and put it in the right place for you. 
+
+ecoreg <- sf::st_read(here::here("WWF_biomes/wwf_terr_ecos.shp")) %>%
+  sf::st_crop(., ext_occ) %>%  ##cropping to the area of interest
+  dplyr::select(OBJECTID, ECO_NAME) ##just selecting out the columns we're interested in
+
+background_sampler(
+  sp_name = sp_name,
+  in_dir = here::here("points/rarefied"),
+  out_dir = here::here("points/background"),
+  dens_abs = "density",
+  density = 100,
+  type = "background",
+  polygon = ecoreg
+)
+
+background_sampler(
+  sp_name = sp_name,
+  in_dir = here::here("points/rarefied"),
+  out_dir = here::here("points/pseudoabsence"),
+  dens_abs = "density",
+  density = 100,
+  type = "pseudoabsence",
+  buffer = 100,
+  polygon = ecoreg
+)
+
+```
+Step 7
+Extract environmental data for background points:
+
+```{r}
+
+if (!dir.exists(here::here("environmental/background/"))) {
+  dir.create(here::here("environmental/background/"))
+}
+
+ras_extract(
+  sp_name = sp_name,
+  in_dir = here::here("points/background"),
+  out_dir = here::here("environmental/background"),
+  raster_in = env_crop
+)
+
+```
+
+
+Extract environmental data for pseudoabsence points:
+
+```{r pseudo.extract}
+
+if (!dir.exists(here::here("environmental/pseudoabsence/"))) {
+  dir.create(here::here("environmental/pseudoabsence/"))
+}
+
+ras_extract(
+  sp_name = sp_name,
+  in_dir = here::here("points/pseudoabsence"),
+  out_dir = here::here("environmental/pseudoabsence/"),
+  raster_in = env_crop
+)
+
+
+if (!dir.exists(here::here("predictions/bioclim/"))) {
+  dir.create(here::here("predictions/bioclim"), recursive = TRUE)
+}
+
+if (!dir.exists(here::here("predictions/glm/"))) {
+  dir.create(here::here("predictions/glm"), recursive = TRUE)
+}
+
+if (!dir.exists(here::here("predictions/rf/"))) {
+  dir.create(here::here("predictions/rf"), recursive = TRUE)
+}
+
+```
+
+Step 8
+Fit Bioclim model:
+
+Once you have fit the models using the next three function calls, the saved model objects will be in model_out_dir.
+**Load clustEvalPa(), tssCalc(), fitBC(), and getThreshold() functions**
+```{r fitBC}
+
+fitBC(sp_name = sp_name,
+  pres_dir = here::here("environmental/presence/"),
+  backg_dir = here::here("environmental/pseudoabsence/"),
+  predictor_names = bioclim_layers,
+  predictors = env_crop,
+  pred_out_dir = here::here("predictions/bioclim/"),
+  eval_out_dir = here::here("evaluation/bioclim/"),
+  model_out_dir = here::here("models/"),
+  overwrite = TRUE,
+  eval = TRUE
+)
+
+# should now have file called "sp_name_bioclim_model.RDS" in folder "models/"
+
+```
+
+Step 9
+Fit Generalized Linear Model:
+**Load clustEvalSdm() and fitGLM()**
+
+```{r GLM}
+
+fitGLM(
+  sp_name = sp_name,
+  pres_dir = here::here("environmental/presence/"),
+  backg_dir = here::here("environmental/pseudoabsence/"),
+  predictor_names = bioclim_layers,
+  predictors = env_crop,
+  pred_out_dir = here::here("predictions/glm/"),
+  eval_out_dir = here::here("evaluation/glm/"),
+  model_out_dir = here::here("models/"),
+  overwrite = TRUE,
+  eval = TRUE
+)
+
+# should now have file called "sp_name_GLM.RDS" in folder "models/"
+
+```
+
+Step 10
+Fit Random Forest:
+**Load fitRF()**
+
+```{r RF}
+
+fitRF(
+  sp_name = sp_name,
+  pres_dir = here::here("environmental/presence/"),
+  backg_dir = here::here("environmental/pseudoabsence/"),
+  predictor_names = bioclim_layers,
+  predictors = env_crop,
+  pred_out_dir = here::here("predictions/rf/"),
+  eval_out_dir = here::here("evaluation/rf/"),
+  model_out_dir = here::here("models/"),
+  overwrite = TRUE,
+  eval = TRUE
+)
+
+# should now have file called "sp_name_randomforest_model.RDS" in folder "models/"
+
+```
+
+Step 11
+Get Evaluations and AUCs:
+**Load get_eval()**
+**This is where you set the threshold type**
+```{r eval}
+
+# may need to capitalize sp_name for this
+eval_files <- list.files(
+    here::here("evaluation/"),
+    full.names = TRUE,
+    recursive = TRUE,
+    pattern = paste0("*", sp_name)
+  )
+
+# using tss threshold here... other options available to play with for better fit
+#"spec_sens", "no_omission", "prevalence", "equal_sens_spec", "tss"
+evals_out <- lapply(eval_files, get_eval, threshold = "tss")
+
+eval_df <- do.call(rbind, evals_out)
+eval_df$sp_name <- as.character(eval_df$sp_name)
+
+```
+
+Step 11b
+
+```{r}
+
+# Plotting the Model Results
+
+bc_plot <- raster(paste0(here::here("predictions/bioclim/"), "/", sp_name, "_bioclim.tif"))
+glm_plot <- raster(paste0(here::here("predictions/glm/"), "/", sp_name, "_glm.tif"))
+rf_plot <-  raster(paste0(here::here("predictions/rf/"), "/", sp_name, "_rf.tif"))
+
+cuts = seq(0,1,0.05)#set breaks
+pal <- colorRampPalette(c("grey","forestgreen","darkgreen"))
+
+#par(mfrow = c(2,2)) #change this to c(1,1) if you don't want all the plots in a pane
+#plot(bc_plot, main = "Bioclim", breaks=cuts, col = pal(length(cuts)))
+#plot(glm_plot, main = "GLM", breaks=cuts, col = pal(length(cuts)))
+#plot(rf_plot, main = "RF", breaks=cuts, col = pal(length(cuts)))
+
+
+# Plotting the model results with thresholds from eval_df
+xy <-  read.csv(paste0(here::here("points/rarefied/"), "/", sp_name, ".csv"))
+
+plot(bc_plot > eval_df$threshold[which(eval_df$model == "bioclim")], main = "Bioclim")
+points(xy$x, xy$y)
+plot(glm_plot > eval_df$threshold[which(eval_df$model == "glm")], main = "GLM")
+points(xy$x, xy$y)
+plot(rf_plot > eval_df$threshold[which(eval_df$model == "rf")], main = "RF")
+points(xy$x, xy$y)
+
+
+#bioclim <- bc_plot > eval_df$threshold[which(eval_df$model == "bioclim")]
+
+#library(ggmap)
+
+#map <- get_stamenmap(bbox=c(left = 14, bottom = -35, right = 34, top = -22), zoom = 4, maptype = "watercolor")
+
+#ggmap(map) +
+  #theme_void() +
+  #geom_point(data = bioclim, aes(x = Longitude, y = Latitude), color = "black", size = 1)
+  
+
+```
+
+Step 12
+Build Ensemble Models (for contemporary data, based on 2010-2020 occurrence records)
+*Load ensemble_model()*
+
+```{r}
+
+if (!dir.exists(here::here("predictions/ensemble/majority_pa"))) {
+  dir.create(here::here("predictions/ensemble/majority_pa"),
+             recursive = TRUE)
+}
+
+if (!dir.exists(here::here("predictions/ensemble/weighted"))) {
+  dir.create(here::here("predictions/ensemble/weighted"))
+}
+
+preds <- list.files(
+    here::here("predictions/"),
+    full.names = TRUE,
+    recursive = TRUE,
+    pattern =  paste0("*", sp_name)
+  )
+
+preds <- preds[!grepl("/ensemble/", preds)]
+
+maj_pa_AN <- ensemble_model(
+  sp_name = sp_name,
+  eval_df = eval_df,
+  preds = preds,
+  method = "majority_pa",
+  out_dir = here::here("predictions/ensemble")
+) #if you get an error [[x]] subscript out of bounds; check the preds. If empty, check capitalization of files under the predictions folder. May need to make uppercase or lowercase.
+
+weighted_AN <- ensemble_model(
+  sp_name = sp_name,
+  eval_df = eval_df,
+  preds = preds,
+  method = "weighted",
+  out_dir = here::here("predictions/ensemble")
+)
+
+```
+
+Now plot! 
+
+```{r}
+xy <-  read.csv(paste0(here::here("points/rarefied/"), "/", sp_name, ".csv"))
+
+
+cuts = seq(0,1,0.05)#set breaks
+pal <- colorRampPalette(c("grey94","forestgreen","#339900"))
+
+plot(maj_pa_AN, main = paste("Aphis nerii", "\n", "Current predicted distribution"), sub = "Majority PA ensemble", cex.main=1.0, col = pal(length(cuts)))
+points(xy$x, xy$y)
+
+plot(weighted_AN, main = paste("aphis nerii", "\n", "Current predicted distribution"), sub = "Weighted ensemble", cex.main=1.0, col = pal(length(cuts)))
+points(xy$x, xy$y)
+
+# plot both together
+#par(mfrow = c(1,2)) #change this to c(1,1) if you don't want all the plots in a pane
+
+
+```
+
+**ADDITIONAL STEPS FOR FUTURE SCENARIOS**
+
+Model: HadGEM, CHELSA data
+Time period: 2041-2060, and 2061-2080
+Scenarios: rcp4.5 and rcp8.5
+
+These functions will load those models up and take future climate predictions and then make the new predictions and save them into the pred_out_dir (the same place all predictions have previously gone). Run these for each future scenario you want to predict.They will be named with the future scenario name.
+
+Step 13
+Load in and prepare climate data
+```{r}
+# Future scenarios: 
+
+# years 2041 - 2060, HadGEM model
+path_4045 <- 'CHELSA_future/2041-2060/rcp45/'
+path_4085 <- 'CHELSA_future/2041-2060/rcp85/'
+
+# years 2061-2080, HadGEM model
+path_6045 <- 'CHELSA_future/2061-2080/rcp45/'
+path_6085 <- 'CHELSA_future/2061-2080/rcp85/'
+
+# future biolayers
+
+# years 2041 - 2060, HadGEM model
+bio_layers_4045 <- list.files(path_4045, pattern = 'tif') # five TIFs
+bio_layers_40451<-paste(path_4045, bio_layers_4045, sep="")
+
+bio_layers_4085 <- list.files(path_4085, pattern = 'tif') 
+bio_layers_40851<-paste(path_4085, bio_layers_4085, sep="")
+
+# years 2061-2080, HadGEM model
+bio_layers_6045 <- list.files(path_6045, pattern = 'tif') 
+bio_layers_60451<-paste(path_6045, bio_layers_6045, sep="")
+
+bio_layers_6085 <- list.files(path_6085, pattern = 'tif') 
+bio_layers_60851<-paste(path_6085, bio_layers_6085, sep="")
+
+# rasterify the layers
+bio_layers40452 <-lapply(bio_layers_40451,raster) # 2040 - 2060; RCP4.5
+env_layers_4045 <- raster::stack(bio_layers40452)
+
+bio_layers40852 <-lapply(bio_layers_40851,raster) # 2040 - 2060; RCP8.5
+env_layers_4085 <- raster::stack(bio_layers40852)
+
+bio_layers60452 <-lapply(bio_layers_60451,raster) # 2060 - 2080; RCP4.5
+env_layers_6045 <- raster::stack(bio_layers60452)
+
+bio_layers60852 <-lapply(bio_layers_60851,raster) # 2060 - 2080; RCP8.5
+env_layers_6085 <- raster::stack(bio_layers60852)
+
+# Crop environmental layers to ext_occ for future scenarios
+# These will be fed as input to the functions fitBC_future(), fitGLM_future(), and fitRF_future() in step 13
+env_crop_4045 <- raster::crop(env_layers_4045, ext_occ) # 2040 - 2060; RCP4.5
+env_crop_4085 <- raster::crop(env_layers_4085, ext_occ) # 2040 - 2060; RCP8.5
+env_crop_6045 <- raster::crop(env_layers_6045, ext_occ) # 2060 - 2080; RCP4.5
+env_crop_6085 <- raster::crop(env_layers_6085, ext_occ) # 2060 - 2080; RCP8.5
+
+```
+
+Step 14
+Predict from models using future climate data:
+*Load functions fitBC_future(), fitGLM_future()*
+```{r}
+
+# Years 2041-2060, rcp4.5 data 
+fitBC_future(
+  sp_name = sp_name,
+  predictor_names = bioclim_layers,
+  future_predictors = env_crop_6085,
+  model_in_dir = here::here("models/"),
+  scenario = 6085,
+  pred_out_dir = here::here("predictions_6085/bioclim/"),
+  overwrite = TRUE,
+)
+
+        
+```
+
+
+```{r GLMfuture}
+
+fitGLM_future(
+  sp_name = sp_name,
+  predictor_names = bioclim_layers,
+  future_predictors = env_crop_6085,
+  model_in_dir = here::here("models/"),
+  pred_out_dir = here::here("predictions_6085/glm/"),
+  scenario = 6085,
+  overwrite = TRUE,)
+
+```
+
+
+```{r RFfuture}
+
+fitRF_future(
+  sp_name = sp_name,
+  predictor_names = bioclim_layers,
+  future_predictors = env_crop_6085,
+  model_in_dir = here::here("models/"),
+  pred_out_dir = here::here("predictions_6085/rf/"),
+  scenario = 6085,
+  overwrite = TRUE
+)
+
+```
+
+Step 15
+Build majority p/a and weighted ensemble models from predictions in step 14
+
+You SHOULD be able to use the existing ensemble_model function to build future ensembles. You just need to change one thing compared to normal. 
+
+preds - this would be the loaded up .tif files for the future scenario (one per model), rather than the predictions you would use normally.
+
+evals_df is the exact same object you would use from before (however you normally acquire that) - the evaluations from the model fitted to current data.
+**load ensemble_model_future()**
+
+```{r}
+
+preds <- list.files(
+    here::here("predictions_6085"),
+    full.names = TRUE,
+    recursive = TRUE,
+    pattern =  paste0("*", sp_name, "_", "6085") 
+  )
+
+preds <- preds[!grepl("/ensemble/", preds)]
+
+maj_pa_6085_AN <- ensemble_model_future(
+  sp_name = sp_name,
+  eval_df = eval_df,
+  preds = preds,
+  scenario = 6085,
+  method = "majority_pa",
+  out_dir = here::here("predictions_6085/ensemble")
+)
+
+weighted_6085_AN <- ensemble_model_future(
+  sp_name = sp_name,
+  eval_df = eval_df,
+  preds = preds,
+  scenario = 6085,
+  method = "weighted",
+  out_dir = here::here("predictions_6085/ensemble")
+)
+
+```
+
+
+Plot the future
+
+```{r}
+
+cuts = seq(0,1,0.05)#set breaks
+pal <- colorRampPalette(c("grey94","forestgreen","#339900"))
+
+plot(maj_pa_6045_AN, main = paste("Aphis Nerii", "\n", "2061-2080, RCP4.5"), sub = "Majority PA ensemble", cex.main=1.0, col = pal(length(cuts)))
+
+
+plot(maj_pa_6085_AN, main = paste("Aphis Nerii", "\n", "2061-2080, RCP4.5"), sub = "Weighted ensemble", cex.main=1.0, col = pal(length(cuts)))
+
+```
+
+
+```{r comboplot}
+
+# step 1: Multiple all values in future map by 2
+# now absence is 0 and presence is between 1 and 2
+future_6085 <- maj_pa_6085_AN * 2
+
+# combine with present, where absence is 0 and presence between 0 and 1
+combinedmajpa <- maj_pa_6045_AN + future_6085
+
+# write into a raster; then load tif into qGIS to manipulate / crop layer
+raster::writeRaster(combinedmajpa, paste0("6045_85_",sp_name, "_ensemble.tif"), overwrite = TRUE)
+  
+# blue #3d62fc # purple #b213d6
+plot(combinedmajpa, col = c("grey94", "forestgreen", "orange", "#b213d6"), main = paste("Aphis Nerii", "\n", "2061-2080, RCP 4.5 vs RCP 8.5"), sub = "Majority PA ensemble", cex.main=1.0)
+```
+
+
+```{r crop}
+# read modified qGIS raster back in here to plot
+AN_box5 <- raster("Zoominsets/AN_box5_60s.tif")
+
+plot(AN_box5, col = c("grey94", "forestgreen", "orange", "#b213d6"), main = paste("Aphis Nerii", "\n", "2061-2080, RCP 4.5 vs RCP 8.5"), sub = "Majority PA ensemble", cex.main=1.0)
+
+```
+
+Make bar charts of the extent of occurrence (# presence grid cells) through time:
+
+```{r barcharts}
+
+library(tidyr)
+
+# make results df
+Bar <- as.data.frame(matrix(nrow = 2, ncol = 6))
+colnames(Bar) <- c("Species", "Current", "4045", "4085", "6045", "6085")
+Bar$Species <- (c("Nezara Viridula", "Aphis Nerii"))
+
+totalCells <- length(maj_pa@data@values)
+
+# count number of presence grid cells
+Bar[1, "Current"] <- length(which(maj_pa@data@values == 1))
+Bar[1, "CurrentNA"] <- length(which(is.na(maj_pa@data@values)))
+Bar[1, "Current0"] <- length(which(maj_pa@data@values == 0))
+
+Bar[1, "4045"] <- length(which(maj_pa_4045@data@values == 1))
+Bar[1, "4085"] <- length(which(maj_pa_4085@data@values == 1))
+Bar[1, "6045"] <- length(which(maj_pa_6045@data@values == 1))
+Bar[1, "6085"] <- length(which(maj_pa_6085@data@values == 1))
+
+Bar[2, "Current"] <- length(which(maj_pa_AN@data@values == 1))
+Bar[2, "CurrentNA"] <- length(which(is.na(maj_pa_AN@data@values)))
+Bar[2, "Current0"] <- length(which(maj_pa_AN@data@values == 0))
+
+Bar[2, "4045"] <- length(which(maj_pa_4045_AN@data@values == 1))
+Bar[2, "4085"] <- length(which(maj_pa_4085_AN@data@values == 1))
+Bar[2, "6045"] <- length(which(maj_pa_6045_AN@data@values == 1))
+Bar[2, "6085"] <- length(which(maj_pa_6085_AN@data@values == 1))
+
+
+# set names of scenarios
+
+# long format to plot dodged bar chart
+bar_long <- gather(Bar, scenario, value, Current:`6085`)
+bar_long$scenario <- factor(bar_long$scenario, levels = c("Current", "4045", "4085", "6045", "6085"))
+bar_long$pc <- round(bar_long$value / 3052546 * 100, digits = 2)
+bar_long$pc <- paste(bar_long$pc, "%")
+
+barplot <- ggplot(data = bar_long, aes(x = scenario, y = value, fill = factor(Species, levels = c("Nezara Viridula", "Aphis Nerii")))) +
+  geom_bar(width = 0.7, stat = "identity", position = "dodge",  colour = "black") +
+  theme_minimal() +
+  scale_y_continuous(labels = comma, limits = c(0, 100000)) +
+  scale_fill_manual(values = c("#53d0db", "red")) +
+  labs(y= "Number of presence cells", x = "Time period and climate scenario") +
+  scale_x_discrete(labels = c("Current", "RCP 4.5", "RCP 8.5", "RCP 4.5", "RCP 8.5")) +
+  labs(fill='Species') +
+  geom_text(aes(label = paste(value, "\n", pc)), vjust=-0.4, size=3.5, position = position_dodge(0.7)) + 
+  theme(aspect.ratio = 0.4,
+        axis.text = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12)
+  )
+
+library(scales)
+
+
+```
